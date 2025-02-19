@@ -119,7 +119,11 @@ entities. Each one is useful under different conditions.
 #include "tier0/fasttimer.h"
 #include "utllinkedlist.h"
 #include "utldict.h"
+#if defined( WIN32 ) && _MSC_VER <= 1920
+#include <typeinfo.h>
+#else
 #include <typeinfo>
+#endif
 #include "tier1/utlintrusivelist.h"
 #include "tier1/utlstring.h"
 

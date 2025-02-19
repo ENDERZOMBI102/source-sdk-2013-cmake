@@ -16,6 +16,12 @@
 #include <windows.h>
 #endif
 
+#include "tier0/dbg.h"
+#include "tier0/memalloc.h"
+#include <string.h>
+#include <stdio.h>
+#include "memdbgoff.h"
+
 #ifdef _WIN32
 // ARG: crtdbg is necessary for certain definitions below,
 // but it also redefines malloc as a macro in release.
@@ -25,6 +31,11 @@
 #ifdef NDEBUG
 #undef _DEBUG
 #endif
+// Turn this back off in release mode.
+#ifdef NDEBUG
+#undef _DEBUG
+#endif
+#endif
 
 #include "tier0/dbg.h"
 #include "tier0/memalloc.h"
@@ -32,18 +43,15 @@
 #include <stdio.h>
 #include "memdbgoff.h"
 
-// Turn this back off in release mode.
-#ifdef NDEBUG
-#undef _DEBUG
-#endif
-#elif POSIX
+
+#if POSIX
 #define __cdecl
 #endif
 
 #if defined( _WIN32 ) && !defined( _X360 )
 const char *MakeModuleFileName()
 {
-	if ( g_pMemAlloc->IsDebugHeap() )
+	if ( g_pMemAlloc && g_pMemAlloc->IsDebugHeap() )
 	{
 		char *pszModuleName = (char *)HeapAlloc( GetProcessHeap(), 0, MAX_PATH ); // small leak, debug only
 
@@ -68,9 +76,32 @@ const char *MakeModuleFileName()
 	return NULL;
 }
 
+//-----------------------------------------------------------------------------
+// Purpose: helper class to detect when static construction has been done by the CRT
+//-----------------------------------------------------------------------------
+class CStaticConstructionCheck
+{
+public:
+	volatile bool m_bConstructed = true;
+};
+
+static CStaticConstructionCheck s_CheckStaticsConstructed;
+
+const char *GetModuleFileName()
+{
+#if !defined(_MSC_VER) || ( _MSC_VER >= 1900 ) //  VC 2015 and above, with the UCRT, will crash if you use a static before it is constructed
+	if ( !s_CheckStaticsConstructed.m_bConstructed )
+		return nullptr;
+#endif
+
+	static const char *pszOwner = MakeModuleFileName();
+	return pszOwner;
+}
+
+
 static void *AllocUnattributed( size_t nSize )
 {
-	static const char *pszOwner = MakeModuleFileName();
+	const char *pszOwner = GetModuleFileName();
 
 	if ( !pszOwner )
 		return g_pMemAlloc->Alloc(nSize);
@@ -80,7 +111,7 @@ static void *AllocUnattributed( size_t nSize )
 
 static void *ReallocUnattributed( void *pMem, size_t nSize )
 {
-	static const char *pszOwner = MakeModuleFileName();
+	const char *pszOwner = GetModuleFileName();
 
 	if ( !pszOwner )
 		return g_pMemAlloc->Realloc(pMem, nSize);
@@ -105,15 +136,14 @@ inline void *ReallocUnattributed( void *pMem, size_t nSize )
 // Standard functions in the CRT that we're going to override to call our allocator
 //-----------------------------------------------------------------------------
 #if defined(_WIN32) && !defined(_STATIC_LINKED)
-
-#ifndef _CRTNOALIAS
-#define _CRTNOALIAS //__declspec(noalias)
-#endif
-
 // this magic only works under win32
 // under linux this malloc() overrides the libc malloc() and so we
 // end up in a recursion (as g_pMemAlloc->Alloc() calls malloc)
-#if _MSC_VER >= 1400
+#if _MSC_VER >= 1900
+#define SUPPRESS_INVALID_PARAMETER_NO_INFO
+#define ALLOC_CALL  __declspec(restrict)
+#define FREE_CALL
+#elif _MSC_VER >= 1400
 #define ALLOC_CALL _CRTNOALIAS _CRTRESTRICT 
 #define FREE_CALL _CRTNOALIAS 
 #else
@@ -156,6 +186,9 @@ extern "C"
 
 // 64-bit
 #ifdef _WIN64
+#if ( defined ( _MSC_VER ) && _MSC_VER >= 1900 )
+	_CRTRESTRICT
+#endif
 void* __cdecl _malloc_base( size_t nSize )
 {
 	return AllocUnattributed( nSize );
@@ -179,15 +212,27 @@ ALLOC_CALL void *_realloc_base( void *pMem, size_t nSize )
 	return ReallocUnattributed( pMem, nSize );
 }
 
-ALLOC_CALL void *_recalloc_base( void *pMem, size_t nCount, size_t nSize )
+#if ( defined ( _MSC_VER ) && _MSC_VER >= 1920 )
+ALLOC_CALL void* _recalloc_base( void* pMem, size_t nCount, size_t nSize )
 {
-	void *pMemOut = ReallocUnattributed( pMem, nSize * nCount );
+	void* pMemOut = ReallocUnattributed( pMem, nSize * nCount );
+	if ( !pMem )
+	{
+		memset( pMemOut, 0, nSize * nCount );
+	}
+	return pMemOut;
+}
+#else
+ALLOC_CALL void *_recalloc_base( void *pMem, size_t nSize )
+{
+	void *pMemOut = ReallocUnattributed( pMem, nSize );
 	if ( !pMem )
 	{
 		memset( pMemOut, 0, nSize );
 	}
 	return pMemOut;
 }
+#endif
 
 void _free_base( void *pMem )
 {
@@ -218,7 +263,11 @@ void * __cdecl _realloc_crt(void *ptr, size_t size)
 
 void * __cdecl _recalloc_crt(void *ptr, size_t count, size_t size)
 {
+#if ( defined ( _MSC_VER ) && _MSC_VER >= 1920 )
 	return _recalloc_base( ptr, count, size );
+#else
+	return _recalloc_base( ptr, size * count );
+#endif
 }
 
 ALLOC_CALL void * __cdecl _recalloc ( void * memblock, size_t count, size_t size )
@@ -231,7 +280,11 @@ ALLOC_CALL void * __cdecl _recalloc ( void * memblock, size_t count, size_t size
 	return pMem;
 }
 
-size_t _msize_base( void *pMem ) noexcept
+#if ( defined ( _MSC_VER ) && _MSC_VER >= 1930 )
+size_t _msize_base( void* pMem ) noexcept
+#else
+size_t _msize_base( void *pMem )
+#endif
 {
 	return g_pMemAlloc->GetSize(pMem);
 }
@@ -390,6 +443,15 @@ void __cdecl operator delete( void *pMem )
 }
 
 #ifdef OSX
+void operator delete(void*pMem, std::size_t)
+#else
+void operator delete(void*pMem, std::size_t) throw()
+#endif
+{
+	g_pMemAlloc->Free( pMem );
+}
+
+#ifdef OSX
 void *__cdecl operator new[]( size_t nSize ) throw (std::bad_alloc)
 #else
 void *__cdecl operator new[]( size_t nSize )
@@ -538,9 +600,38 @@ ALLOC_CALL void *__cdecl _aligned_malloc_base( size_t size, size_t align )
 	return MemAlloc_AllocAligned( size, align );
 }
 
+inline void *MemAlloc_Unalign( void *pMemBlock )
+{
+	unsigned *pAlloc = (unsigned *)pMemBlock;
+
+	// pAlloc points to the pointer to starting of the memory block
+	pAlloc = (unsigned *)(((size_t)pAlloc & ~(sizeof( void * ) - 1)) - sizeof( void * ));
+
+	// pAlloc is the pointer to the start of memory block
+	return *((unsigned **)pAlloc);
+}
+
 ALLOC_CALL void *__cdecl _aligned_realloc_base( void *ptr, size_t size, size_t align )
 {
-	return MemAlloc_ReallocAligned( ptr, size, align );
+	if ( ptr && !size )
+	{
+		MemAlloc_FreeAligned( ptr );
+		return NULL;
+	}
+
+	void *pNew = MemAlloc_AllocAligned( size, align );
+	if ( ptr )
+	{
+		void *ptrUnaligned = MemAlloc_Unalign( ptr );
+		size_t oldSize = g_pMemAlloc->GetSize( ptrUnaligned );
+		size_t oldOffset = (uintp)ptr - (uintp)ptrUnaligned;
+		size_t copySize = oldSize - oldOffset;
+		if ( copySize > size )
+			copySize = size;
+		memcpy( pNew, ptr, copySize );
+		MemAlloc_FreeAligned( ptr );
+	}
+	return pNew;
 }
 
 ALLOC_CALL void *__cdecl _aligned_recalloc_base( void *ptr, size_t size, size_t align )
@@ -641,9 +732,8 @@ int _CrtSetDbgFlag( int nNewFlag )
 }
 
 // 64-bit port.
-#define AFNAME(var) __p_ ## var
+#define AFNAME(var) __p_##var
 #define AFRET(var)  &var
-
 #if defined(_crtDbgFlag)
 #undef _crtDbgFlag
 #endif
@@ -881,7 +971,7 @@ ErrorHandlerRegistrar::ErrorHandlerRegistrar()
 	_set_invalid_parameter_handler( VInvalidParameterHandler );
 }
 
-#if defined( _DEBUG ) && _MSC_VER < 1930
+#if defined( _DEBUG )
  
 // wrapper which passes no debug info; not available in debug
 #ifndef	SUPPRESS_INVALID_PARAMETER_NO_INFO
@@ -959,7 +1049,10 @@ extern "C" void * __cdecl _aligned_offset_recalloc_dbg( void * memblock, size_t 
 {
 	Assert( IsPC() || 0 );
 	void *pMem = ReallocUnattributed( memblock, size * count );
-	memset( pMem, 0, size * count );
+	if ( !memblock )
+	{
+		memset( pMem, 0, size * count );
+	}
 	return pMem;
 }
 
@@ -1101,7 +1194,7 @@ void __cdecl _aligned_free_dbg( void * memblock)
     _aligned_free(memblock);
 }
 
-#if _MSC_VER < 1930
+#if _MSC_VER < 1900
 size_t __cdecl _CrtSetDebugFillThreshold( size_t _NewDebugFillThreshold)
 {
 	assert(0);
@@ -1193,7 +1286,7 @@ wchar_t * __cdecl _wcsdup ( const wchar_t * string )
 // 	XBox Memory Allocator Override
 //-----------------------------------------------------------------------------
 #if defined( _X360 )
-#if defined( _DEBUG ) || defined( USE_MEM_DEBUG )
+#if defined( USE_MEM_DEBUG )
 #include "utlmap.h"
 
 MEMALLOC_DEFINE_EXTERNAL_TRACKING( XMem );
@@ -1332,12 +1425,7 @@ SIZE_T WINAPI XMemSize( PVOID pAddress, DWORD dwAllocAttributes )
 
 	return XMemSizeDefault( pAddress, dwAllocAttributes );
 }
-#endif // _X360
-
-#define MAX_LANG_LEN        64  /* max language name length */
-#define MAX_CTRY_LEN        64  /* max country name length */
-#define MAX_MODIFIER_LEN    0   /* max modifier name length - n/a */
-#define MAX_LC_LEN          (MAX_LANG_LEN+MAX_CTRY_LEN+MAX_MODIFIER_LEN+3)
+#endif
 
 #pragma warning(push)
 #pragma warning(disable: 4483)
